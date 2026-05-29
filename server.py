@@ -10,6 +10,8 @@ from collections import deque
 from contextlib import asynccontextmanager
 from pathlib import Path
 
+import yaml
+
 from starlette.applications import Starlette
 from starlette.authentication import (
     AuthCredentials,
@@ -37,8 +39,21 @@ if not ADMIN_PASSWORD:
 
 HERMES_HOME = os.environ.get("HERMES_HOME", str(Path.home() / ".hermes"))
 ENV_FILE_PATH = Path(HERMES_HOME) / ".env"
+CONFIG_YAML_PATH = Path(HERMES_HOME) / "config.yaml"
 PAIRING_DIR = Path(HERMES_HOME) / "pairing"
 CODE_TTL_SECONDS = 3600
+
+# Maps provider env-var key → (hermes provider name, default base_url)
+# Order determines priority when multiple keys are set.
+PROVIDER_CONFIG: list[tuple[str, str, str]] = [
+    ("OPENROUTER_API_KEY", "openrouter", "https://openrouter.ai/api/v1"),
+    ("DEEPSEEK_API_KEY",   "deepseek",   "https://api.deepseek.com/v1"),
+    ("DASHSCOPE_API_KEY",  "alibaba",    "https://dashscope-intl.aliyuncs.com/compatible-mode/v1"),
+    ("GLM_API_KEY",        "zai",        "https://api.z.ai/api/paas/v4"),
+    ("KIMI_API_KEY",       "kimi-coding","https://api.moonshot.ai/v1"),
+    ("MINIMAX_API_KEY",    "minimax",    "https://api.minimax.io/anthropic"),
+    ("HF_TOKEN",           "huggingface","https://router.huggingface.co/v1"),
+]
 
 # Registry of known Hermes env vars exposed in the UI.
 # Each entry: (key, label, category, is_password)
@@ -156,6 +171,47 @@ def write_env_file(path: Path, env_vars: dict[str, str]):
         lines.append("")
 
     path.write_text("\n".join(lines) + "\n" if lines else "")
+
+
+def write_hermes_yaml_config(env_vars: dict[str, str]):
+    """Write model block to config.yaml. Hermes no longer reads LLM_MODEL from .env."""
+    CONFIG_YAML_PATH.parent.mkdir(parents=True, exist_ok=True)
+
+    existing: dict = {}
+    if CONFIG_YAML_PATH.exists():
+        try:
+            existing = yaml.safe_load(CONFIG_YAML_PATH.read_text()) or {}
+        except Exception:
+            existing = {}
+
+    # Detect first provider with a key set
+    active_provider: str | None = None
+    active_base_url: str | None = None
+    for env_key, pname, purl in PROVIDER_CONFIG:
+        if env_vars.get(env_key):
+            active_provider = pname
+            active_base_url = purl
+            break
+
+    llm_model = env_vars.get("LLM_MODEL", "")
+
+    # Update only the keys we manage; preserve everything else in model:
+    model_block: dict = {}
+    if isinstance(existing.get("model"), dict):
+        model_block = dict(existing["model"])
+
+    if active_provider:
+        model_block["provider"] = active_provider
+        model_block["base_url"] = active_base_url
+    if llm_model:
+        model_block["default"] = llm_model
+
+    if model_block:
+        existing["model"] = model_block
+
+    CONFIG_YAML_PATH.write_text(
+        yaml.dump(existing, default_flow_style=False, allow_unicode=True)
+    )
 
 
 def mask_secrets(env_vars: dict[str, str]) -> dict[str, str]:
@@ -341,6 +397,7 @@ async def api_config_put(request: Request):
                 if key not in merged:
                     merged[key] = value
             write_env_file(ENV_FILE_PATH, merged)
+            write_hermes_yaml_config(merged)
 
         if restart:
             asyncio.create_task(gateway.restart())
