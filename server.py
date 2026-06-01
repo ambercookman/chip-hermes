@@ -585,6 +585,35 @@ async def api_pairing_approved(request: Request):
     return JSONResponse({"approved": results})
 
 
+async def telegram_webhook_proxy(request: Request):
+    """Forward Telegram webhook POSTs to the hermes gateway's internal webhook server.
+
+    Railway only exposes one port (PORT/8080). The hermes gateway starts its own
+    webhook listener on TELEGRAM_WEBHOOK_PORT (default 8443). This route receives
+    Telegram's HTTPS POST on port 8080 and forwards it to the internal listener so
+    webhook mode works without exposing a second port.
+    """
+    webhook_port = int(os.environ.get("TELEGRAM_WEBHOOK_PORT", "8443"))
+    body = await request.body()
+    import httpx
+    try:
+        async with httpx.AsyncClient() as client:
+            resp = await client.post(
+                f"http://127.0.0.1:{webhook_port}/telegram",
+                content=body,
+                headers={
+                    "content-type": request.headers.get("content-type", "application/json"),
+                    "x-telegram-bot-api-secret-token": request.headers.get(
+                        "x-telegram-bot-api-secret-token", ""
+                    ),
+                },
+                timeout=10.0,
+            )
+        return PlainTextResponse(resp.text, status_code=resp.status_code)
+    except Exception as e:
+        return PlainTextResponse(f"Webhook proxy error: {e}", status_code=502)
+
+
 async def api_pairing_revoke(request: Request):
     auth_err = require_auth(request)
     if auth_err:
@@ -630,6 +659,7 @@ routes = [
     Route("/api/pairing/deny", api_pairing_deny, methods=["POST"]),
     Route("/api/pairing/approved", api_pairing_approved),
     Route("/api/pairing/revoke", api_pairing_revoke, methods=["POST"]),
+    Route("/telegram", telegram_webhook_proxy, methods=["POST"]),
 ]
 
 @asynccontextmanager
