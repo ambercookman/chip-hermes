@@ -29,6 +29,7 @@ RUN mkdir -p /data/.hermes
 COPY server.py /app/server.py
 COPY templates/ /app/templates/
 COPY start.sh /app/start.sh
+COPY SOUL.md /app/SOUL.md
 RUN chmod +x /app/start.sh
 
 ENV HOME=/data
