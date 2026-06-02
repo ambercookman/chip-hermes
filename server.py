@@ -1,5 +1,6 @@
 import asyncio
 import base64
+import html
 import json
 import os
 import re
@@ -8,8 +9,10 @@ import signal
 import time
 from collections import deque
 from contextlib import asynccontextmanager
+from datetime import datetime
 from pathlib import Path
 
+import httpx
 import yaml
 
 from starlette.applications import Starlette
@@ -595,7 +598,6 @@ async def telegram_webhook_proxy(request: Request):
     """
     webhook_port = int(os.environ.get("TELEGRAM_WEBHOOK_PORT", "8443"))
     body = await request.body()
-    import httpx
     try:
         async with httpx.AsyncClient() as client:
             resp = await client.post(
@@ -612,6 +614,176 @@ async def telegram_webhook_proxy(request: Request):
         return PlainTextResponse(resp.text, status_code=resp.status_code)
     except Exception as e:
         return PlainTextResponse(f"Webhook proxy error: {e}", status_code=502)
+
+
+async def vapi_webhook(request: Request):
+    """Receive Vapi server messages; send Telegram summary for end-of-call reports."""
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse({"ok": False}, status_code=400)
+
+    print(f"[vapi-webhook] {json.dumps(body)}")
+
+    message = body.get("message") or {}
+    if message.get("type") != "end-of-call-report":
+        return JSONResponse({"ok": True})
+
+    analysis = message.get("analysis") or {}
+    call = message.get("call") or {}
+    artifact = message.get("artifact") or {}
+    customer = call.get("customer") or {}
+
+    summary = analysis.get("summary") or "No summary available."
+    success_eval = analysis.get("successEvaluation")
+    call_id = call.get("id", "")
+    phone_number = customer.get("number", "unknown")
+    ended_reason = message.get("endedReason", "unknown")
+    costs = call.get("costs")
+    transcript_msgs = artifact.get("messages") or []
+
+    # Duration from startedAt / endedAt
+    duration_str = ""
+    try:
+        started_at = call.get("startedAt") or ""
+        ended_at = call.get("endedAt") or ""
+        if started_at and ended_at:
+            start = datetime.fromisoformat(started_at.replace("Z", "+00:00"))
+            end = datetime.fromisoformat(ended_at.replace("Z", "+00:00"))
+            secs = int((end - start).total_seconds())
+            duration_str = f"{secs // 60}m {secs % 60}s"
+    except Exception:
+        pass
+
+    # Cost total
+    cost_str = ""
+    try:
+        if isinstance(costs, list):
+            total = sum(c.get("cost", 0) for c in costs if isinstance(c, dict))
+            cost_str = f"${total:.4f}"
+        elif isinstance(costs, dict):
+            total = costs.get("total")
+            if total is not None:
+                cost_str = f"${float(total):.4f}"
+    except Exception:
+        pass
+
+    e = html.escape
+    parts = [f"📞 <b>Vapi Call Report</b>"]
+    parts.append(f"<b>To:</b> <code>{e(phone_number)}</code>")
+    if call_id:
+        parts.append(f"<b>Call ID:</b> <code>{e(call_id)}</code>")
+    parts.append(f"<b>Ended:</b> {e(ended_reason)}")
+    if duration_str:
+        parts.append(f"<b>Duration:</b> {duration_str}")
+    if success_eval is not None:
+        parts.append(f"<b>Outcome:</b> {e(str(success_eval))}")
+    if cost_str:
+        parts.append(f"<b>Cost:</b> {cost_str}")
+    parts.append("")
+    parts.append(f"<b>Summary:</b>\n{e(summary)}")
+    if transcript_msgs:
+        parts.append(f"\n<i>{len(transcript_msgs)} messages in transcript</i>")
+
+    tg_text = "\n".join(parts)
+
+    env_vars = read_env_file(ENV_FILE_PATH)
+    bot_token = os.environ.get("TELEGRAM_BOT_TOKEN") or env_vars.get("TELEGRAM_BOT_TOKEN", "")
+    allowed_users = os.environ.get("TELEGRAM_ALLOWED_USERS") or env_vars.get("TELEGRAM_ALLOWED_USERS", "")
+
+    if not bot_token or not allowed_users:
+        print("[vapi-webhook] Telegram not configured, skipping notification")
+        return JSONResponse({"ok": True})
+
+    chat_id = allowed_users.split(",")[0].strip()
+    if not chat_id:
+        print("[vapi-webhook] No chat ID in TELEGRAM_ALLOWED_USERS")
+        return JSONResponse({"ok": True})
+
+    try:
+        async with httpx.AsyncClient() as client:
+            resp = await client.post(
+                f"https://api.telegram.org/bot{bot_token}/sendMessage",
+                json={"chat_id": chat_id, "text": tg_text, "parse_mode": "HTML"},
+                timeout=10.0,
+            )
+        if resp.status_code != 200:
+            print(f"[vapi-webhook] Telegram error {resp.status_code}: {resp.text}")
+        else:
+            print(f"[vapi-webhook] Telegram notification sent to {chat_id}")
+    except Exception as exc:
+        print(f"[vapi-webhook] Telegram send failed: {exc}")
+
+    return JSONResponse({"ok": True})
+
+
+async def api_vapi_call(request: Request):
+    """Trigger an outbound Vapi call. Requires admin auth."""
+    auth_err = require_auth(request)
+    if auth_err:
+        return auth_err
+
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse({"error": "Invalid JSON"}, status_code=400)
+
+    required_fields = ["phone_number", "caller_name", "call_purpose", "call_purpose_short", "opening_line"]
+    missing = [f for f in required_fields if not body.get(f)]
+    if missing:
+        return JSONResponse({"error": f"Missing required fields: {', '.join(missing)}"}, status_code=400)
+
+    vapi_api_key = os.environ.get("VAPI_API_KEY", "")
+    vapi_assistant_id = os.environ.get("VAPI_ASSISTANT_ID", "")
+    vapi_phone_number_id = os.environ.get("VAPI_PHONE_NUMBER_ID", "")
+
+    if not vapi_api_key:
+        return JSONResponse({"error": "VAPI_API_KEY not configured"}, status_code=500)
+    if not vapi_assistant_id:
+        return JSONResponse({"error": "VAPI_ASSISTANT_ID not configured"}, status_code=500)
+    if not vapi_phone_number_id:
+        return JSONResponse({"error": "VAPI_PHONE_NUMBER_ID not configured"}, status_code=500)
+
+    variable_values = {
+        "caller_name": body["caller_name"],
+        "call_purpose": body["call_purpose"],
+        "call_purpose_short": body["call_purpose_short"],
+        "questions": body.get("questions") or "N/A",
+        "appointment_details": body.get("appointment_details") or "N/A",
+        "opening_line": body["opening_line"],
+    }
+    if body.get("callback_number"):
+        variable_values["callback_number"] = body["callback_number"]
+
+    vapi_payload = {
+        "assistantId": vapi_assistant_id,
+        "phoneNumberId": vapi_phone_number_id,
+        "customer": {"number": body["phone_number"]},
+        "assistantOverrides": {"variableValues": variable_values},
+    }
+
+    try:
+        async with httpx.AsyncClient() as client:
+            resp = await client.post(
+                "https://api.vapi.ai/call",
+                json=vapi_payload,
+                headers={"Authorization": f"Bearer {vapi_api_key}"},
+                timeout=30.0,
+            )
+        try:
+            resp_body = resp.json()
+        except Exception:
+            resp_body = {"raw": resp.text}
+
+        if resp.status_code >= 400:
+            print(f"[api-vapi-call] Vapi error {resp.status_code}: {resp_body}")
+            return JSONResponse({"error": "Vapi API error", "details": resp_body}, status_code=resp.status_code)
+
+        print(f"[api-vapi-call] Call initiated: {resp_body.get('id', '?')}")
+        return JSONResponse(resp_body)
+    except Exception as exc:
+        print(f"[api-vapi-call] Request failed: {exc}")
+        return JSONResponse({"error": str(exc)}, status_code=502)
 
 
 async def api_pairing_revoke(request: Request):
@@ -659,7 +831,9 @@ routes = [
     Route("/api/pairing/deny", api_pairing_deny, methods=["POST"]),
     Route("/api/pairing/approved", api_pairing_approved),
     Route("/api/pairing/revoke", api_pairing_revoke, methods=["POST"]),
+    Route("/api/vapi-call", api_vapi_call, methods=["POST"]),
     Route("/telegram", telegram_webhook_proxy, methods=["POST"]),
+    Route("/vapi-webhook", vapi_webhook, methods=["POST"]),
 ]
 
 @asynccontextmanager
